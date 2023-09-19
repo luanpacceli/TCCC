@@ -1,7 +1,6 @@
-/* Projeto: rastreador com placa ESP32 TTGO T-Beam,
+/* Projeto: rastreador com placa Exemplo usa placa ESP32 TTGO T-Beam,
 * usando conectividade LoRaWAN (ABP) e já configurado
 * para usar os gateways da ATC.
-* Autor: Pedro Bertoleti
 *
 * Bibliotecas utlizadas:
 * – TinyGPS++: https://github.com/mikalhart/TinyGPSPlus
