@@ -1,0 +1,451 @@
+/* Projeto: rastreador com placa ESP32 TTGO T-Beam,
+* usando conectividade LoRaWAN (ABP) e já configurado
+* para usar os gateways da ATC.
+* Autor: Pedro Bertoleti
+*
+* Bibliotecas utlizadas:
+* – TinyGPS++: https://github.com/mikalhart/TinyGPSPlus
+* – axp20x: https://github.com/lewisxhe/AXP202X_Library
+* – MCCI LoRaWAN LMIC Library: https://github.com/mcci-catena/arduino-lmic (versão 2.3.2)
+*/
+
+#include <TinyGPS++.h>
+#include
+#include
+#include
+#include <hal/hal.h>
+#include
+
+/* Definição – tempo máximo sem alimentar o watchdog */
+#define TEMPO_WATCHDOG_SEGUNDOS 60
+
+/* Definições gerais */
+/* o módulo GPS da placa está ligado na serial 1 do ESP32 */
+#define SERIAL_GPS 1
+#define BAUDRATE_SERIAL_GPS 9600
+#define GPIO_RX_SERIAL_GPS 34
+#define GPIO_TX_SERIAL_GPS 12
+#define TEMPO_ENTRE_POSICOES_GPS 3600 //s
+#define TEMPO_UM_DIA_DE_TRABALHO 28800 //s (28800s = 8h)
+#define TAMANHO_FILA_POSICOES_GPS (28800/TEMPO_ENTRE_POSICOES_GPS)
+#define TEMPO_LEITURA_SERIAL_GPS 1000 //ms
+
+/* definições de temporização das tarefas */
+#define TICKS_ESPERA_POSICAO_GPS ( TickType_t )1000
+#define TICKS_ESPERA_ENVIO_POSICAO_GPS ( TickType_t )10000
+
+/* Baudrate da serial usada para debug (serial monitor) */
+#define BAUDRATE_SERIAL_DEBUG 115200
+
+/* Definições – radio LoRa */
+#define GANHO_LORA_DBM 20 //dBm
+#define RADIO_RESET_PORT 14
+#define RADIO_MOSI_PORT 27
+#define RADIO_MISO_PORT 19
+#define RADIO_SCLK_PORT 5
+#define RADIO_NSS_PORT 18
+#define RADIO_DIO_0_PORT 26
+#define RADIO_DIO_1_PORT 33
+#define RADIO_DIO_2_PORT 32
+
+/* Constantes do LoraWAN */
+/* – Chaves (network e application keys) */
+static const PROGMEM u1_t NWKSKEY[16] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; //coloque aqui sua network session key (obtido no seu distribuidor LoRaWAN)
+static const u1_t PROGMEM APPSKEY[16] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; //coloque aqui sua application session key (obtido no seu distribuidor LoRaWAN)
+
+/* – Device Address */
+static const u4_t DEVADDR = 0x00000000; //coloque aqui o device address do seu dispositivo (obtido no seu distribuidor LoRaWAN)
+
+/* Constantes do rádio LoRa: GPIOs utilizados para comunicação
+com rádio SX1276 */
+const lmic_pinmap lmic_pins = {
+.nss = RADIO_NSS_PORT,
+.rxtx = LMIC_UNUSED_PIN,
+.rst = RADIO_RESET_PORT,
+.dio = {RADIO_DIO_0_PORT, RADIO_DIO_1_PORT, LMIC_UNUSED_PIN}, //dio2 não é utilizado neste hardware (TTGO T-Beam)
+};
+
+/* Filas */
+/* Fila para armazenar posições GPS */
+QueueHandle_t xQueue_GPS;
+
+/* Estrutura de dados de posição */
+typedef struct
+{
+float latitude;
+float longitude;
+int horas;
+int minutos;
+int segundos;
+}TPosicao_GPS;
+
+#define TAMANHO_DADOS_LORAWAN sizeof(TPosicao_GPS)
+
+/* Demais objetos e variáveis globais */
+TinyGPSPlus gps;
+HardwareSerial GPS(SERIAL_GPS);
+AXP20X_Class axp;
+static osjob_t sendjob;
+
+/* Protótipos das funções das tarefas */
+void task_leitura_gps( void *pvParameters );
+void task_lorawan( void *pvParameters );
+
+/* Protótipos de funções gerais */
+void inicializa_lorawan(void);
+bool do_send(osjob_t* j);
+
+/*
+* Implementações
+*/
+
+/* Callbacks para uso com OTAA apenas (por este projeto usar ABP, eles estão vazios) */
+void os_getArtEui (u1_t* buf)
+{
+/* Não utilizado neste projeto */
+}
+
+void os_getDevEui (u1_t* buf)
+{
+/* Não utilizado neste projeto */
+}
+
+void os_getDevKey (u1_t* buf)
+{
+/* Não utilizado neste projeto */
+}
+
+/* Callback de evento: todo evento do LoRaAN irá chamar essa
+callback, de forma que seja possível saber o status da
+comunicação com o gateway LoRaWAN. */
+void onEvent (ev_t ev)
+{
+switch(ev)
+{
+case EV_SCAN_TIMEOUT:
+break;
+case EV_BEACON_FOUND:
+break;
+case EV_BEACON_MISSED:
+break;
+case EV_BEACON_TRACKED:
+break;
+case EV_JOINING:
+break;
+case EV_JOINED:
+break;
+case EV_JOIN_FAILED:
+break;
+case EV_REJOIN_FAILED:
+break;
+case EV_TXCOMPLETE:
+/* COntrole do semáforo serial obtido. Printa na serial as informações do evento. */
+Serial.println (millis());
+Serial.println(F(“EV_TXCOMPLETE (incluindo espera pelas janelas de recepção)”));
+
+/* Verifica se ack foi recebido do gateway */
+if (LMIC.txrxFlags & TXRX_ACK)
+Serial.println(F(“Ack recebido”));
+
+/* Verifica se foram recebidos dados do gateway */
+if (LMIC.dataLen > 0)
+{
+Serial.println(F(“[DOWNLINK LORAWAN] Recebidos “));
+Serial.println(LMIC.dataLen);
+Serial.println(F(” bytes (payload) do gateway”));
+
+/* Como houve recepção de dados do gateway, os coloca
+em um array para uso futuro. */
+uint8_t dados_recebidos = LMIC.frame[LMIC.dataBeg + 0];
+Serial.print(F(“Dados recebidos: “));
+Serial.write(dados_recebidos);
+}
+
+break;
+
+case EV_LOST_TSYNC:
+break;
+case EV_RESET:
+break;
+case EV_RXCOMPLETE:
+break;
+case EV_LINK_DEAD:
+break;
+case EV_LINK_ALIVE:
+break;
+case EV_TXSTART:
+Serial.println(F(“EV_TXSTART”));
+Serial.println (millis());
+Serial.println(LMIC.freq);
+break;
+default:
+break;
+}
+}
+
+/* Função para envio de dados ao gateway LoRaWAN */
+bool do_send(osjob_t* j, TPosicao_GPS posicao_gps)
+{
+bool envio_ok = false;
+static uint8_t mydata[TAMANHO_DADOS_LORAWAN];
+
+/* Monta buffer de envio de dados LoRaWAN */
+memcpy(mydata, (uint8_t *)&posicao_gps, TAMANHO_DADOS_LORAWAN);
+
+/* Verifica se já há um envio sendo feito.
+Em caso positivo, o envio atual é suspenso. */
+if (LMIC.opmode & OP_TXRXPEND)
+{
+Serial.println(F(“OP_TXRXPEND: ha um envio ja pendente, portanto o envio atual nao sera feito”));
+envio_ok = false;
+}
+else
+{
+/* Aqui, o envio (sem confirmação) é feito. */
+/* O pacote LoRaWAN é montado e o coloca na fila de envio. */
+LMIC_setTxData2(4, mydata, sizeof(mydata), 0);
+Serial.println(“Pacote LoRaWAN na fila de envio.”);
+envio_ok = true;
+}
+
+return envio_ok;
+}
+
+/* Função: inicializa LoRaWAN
+* Parametros: nenhum
+* Retorno: nenhum
+*/
+void inicializa_lorawan(void)
+{
+int b;
+uint8_t appskey[sizeof(APPSKEY)];
+uint8_t nwkskey[sizeof(NWKSKEY)];
+
+/* Inicializa comunicação SPI com rádio LoRa */
+SPI.begin(RADIO_SCLK_PORT, RADIO_MISO_PORT, RADIO_MOSI_PORT);
+
+/* Inicializa stack LoRaWAN */
+os_init();
+LMIC_reset();
+
+/* Inicializa chaves usadas na comunicação ABP */
+memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
+memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
+LMIC_setSession (0x13, DEVADDR, nwkskey, appskey);
+
+/* Faz inicializações de rádio pertinentes a região do
+gateway LoRaWAN (ATC / Everynet Brasil) */
+for (b=0; b<8; ++b)
+LMIC_disableSubBand(b);
+
+LMIC_enableChannel(0); // 915.2 MHz
+LMIC_enableChannel(1); // 915.4 MHz
+LMIC_enableChannel(2); // 915.6 MHz
+LMIC_enableChannel(3); // 915.8 MHz
+LMIC_enableChannel(4); // 916.0 MHz
+LMIC_enableChannel(5); // 916.2 MHz
+LMIC_enableChannel(6); // 916.4 MHz
+LMIC_enableChannel(7); // 916.6 MHz
+
+LMIC_setAdrMode(0);
+LMIC_setLinkCheckMode(0);
+
+/* Data rate para janela de recepção RX2 */
+LMIC.dn2Dr = DR_SF12CR;
+
+/* Configura data rate de transmissão e ganho do rádio
+LoRa (dBm) na transmissão */
+LMIC_setDrTxpow(DR_SF12, GANHO_LORA_DBM);
+}
+
+void setup()
+{
+/* Inicializa serial para debug */
+Serial.begin(BAUDRATE_SERIAL_DEBUG);
+
+/* Inicializa comunicação I²C com chip gerenciador de energia (AXP192) */
+Wire.begin(21, 22);
+if (!axp.begin(Wire, AXP192_SLAVE_ADDRESS))
+Serial.println(“Sucesso ao inicializar comunicação com chip de energia (AXP192)”);
+else
+{
+Serial.println(“Falha ao inicializar comunicação com chip de energia (AXP192). O ESP32 será reiniciado…”);
+delay(2000);
+ESP.restart();
+}
+
+/* Concifgura PMIC da placa para energiza módulos
+GPS e LoRa (SX1276) */
+axp.setPowerOutPut(AXP192_LDO2, AXP202_ON);
+axp.setPowerOutPut(AXP192_LDO3, AXP202_ON);
+axp.setPowerOutPut(AXP192_DCDC1, AXP202_ON);
+axp.setPowerOutPut(AXP192_DCDC2, AXP202_ON);
+axp.setPowerOutPut(AXP192_DCDC3, AXP202_ON);
+axp.setPowerOutPut(AXP192_EXTEN, AXP202_ON);
+
+/* Inicializa serial para comunicar com GPS */
+GPS.begin(BAUDRATE_SERIAL_GPS,
+SERIAL_8N1,
+GPIO_RX_SERIAL_GPS,
+GPIO_TX_SERIAL_GPS);
+
+/* Criação das filas */
+xQueue_GPS = xQueueCreate(TAMANHO_FILA_POSICOES_GPS, sizeof(TPosicao_GPS));
+
+if (xQueue_GPS == NULL)
+{
+Serial.println(“Falha ao inicializar filas. O programa nao pode prosseguir. O ESP32 sera reiniciado…”);
+delay(2000);
+ESP.restart();
+}
+
+/* Inicia o Task WDT */
+esp_task_wdt_init(TEMPO_WATCHDOG_SEGUNDOS, true);
+
+/* Configuração das tarefas */
+xTaskCreate(
+task_leitura_gps /* Funcao a qual esta implementado o que a tarefa deve fazer */
+, “leitura_gps” /* Nome (para fins de debug, se necessário) */
+, 4096 /* Tamanho da stack (em words) reservada para essa tarefa */
+, NULL /* Parametros passados (nesse caso, não há) */
+, 6 /* Prioridade */
+, NULL ); /* Handle da tarefa, opcional (nesse caso, não há) */
+
+xTaskCreate(
+task_lorawan
+, “lorawan”
+, 8192
+, NULL
+, 5
+, NULL );
+
+/* O FreeRTOS está inicializado */
+}
+
+void loop()
+{
+/* todas as funcionalidades são feitas pelas tarefas
+task_leitura_gps e task_wifi_mqtt */
+}
+
+/*
+* Tarefas
+*/
+
+/* Esta task é responsável por:
+* – Obter a localização (latitude e longitude) do módulo GPS
+* – Enviar a localização obtida para outras tasks (usando uma fila)
+*/
+void task_leitura_gps( void *pvParameters )
+{
+TPosicao_GPS posicao_gps;
+unsigned long timestamp_start = 0;
+char str_horario[20] = {0};
+
+/* Habilita o monitoramento do Task WDT nesta tarefa */
+esp_task_wdt_add(NULL);
+
+while(1)
+{
+/* Espera pelo tempo (definido em TEMPO_ENTRE_POSICOES_GPS) entre posições GPS */
+esp_task_wdt_reset();
+vTaskDelay( (TEMPO_ENTRE_POSICOES_GPS*1000) / portTICK_PERIOD_MS );
+
+/* Faz a leitura de todos os dados do GPS (por alguns milissegundos) */
+timestamp_start = millis();
+do
+{
+while (GPS.available())
+gps.encode(GPS.read());
+esp_task_wdt_reset();
+} while ( (millis() – timestamp_start) < TEMPO_LEITURA_SERIAL_GPS);
+
+/* Obtem e envia posição / localização para outras tasks usando uma fila*/
+posicao_gps.latitude = gps.location.lat();
+posicao_gps.longitude = gps.location.lng();
+posicao_gps.horas = gps.time.hour();
+posicao_gps.minutos = gps.time.minute();
+posicao_gps.segundos = gps.time.second();
+xQueueSend(xQueue_GPS, ( void * ) &posicao_gps, TICKS_ESPERA_ENVIO_POSICAO_GPS);
+
+Serial.println(“Localizacao GPS obtida:”);
+Serial.print(“* Latitude: “);
+Serial.println(posicao_gps.latitude);
+Serial.print(“* Longitude: “);
+Serial.println(posicao_gps.longitude);
+sprintf(str_horario,”%02d:%02d:%02d”, posicao_gps.horas,
+posicao_gps.minutos,
+posicao_gps.segundos);
+Serial.print(“Horario (GMT 0): “);
+Serial.println(str_horario);
+}
+}
+
+/* Esta task é responsável por:
+* – Gerenciar conextividade LoRaWAN
+* – Enviar, quando houver, as posições GPS da fila para a nuvem
+* via LoRaWAN
+*/
+void task_lorawan( void *pvParameters )
+{
+TPosicao_GPS posicao_gps_recebida;
+
+inicializa_lorawan();
+
+while(1)
+{
+/* Se há ao menos uma posição GPS na fila para serem enviadas via LoRaWAN, faz o envio aqui */
+if( xQueuePeek( xQueue_GPS, &( posicao_gps_recebida ), TICKS_ESPERA_POSICAO_GPS) == pdTRUE)
+{
+/* Se o envio for bem sucedido, consome de fato a posição da fila (com o xQueueReceive).
+Caso contrário, a posição continua na fila para um envio posterior, uma vez que xQueuePeek
+somente le um item da fila e nao o consome */
+if ( do_send(&sendjob, posicao_gps_recebida) == true)
+{
+xQueueReceive( xQueue_GPS, &( posicao_gps_recebida ), TICKS_ESPERA_POSICAO_GPS );
+}
+}
+
+/* Alimenta o watchdog e aguarda 1ms para reiniciar o ciclo */
+esp_task_wdt_reset();
+vTaskDelay( 1 / portTICK_PERIOD_MS );
+}
+
+
+/////
+O tamanho da fila de localizações é automaticamente calculado para suportar 8 horas de localizações gravadas. Esse cálculo é feito em função do tempo entre o envio de localizações geográficas (definido em TEMPO_ENTRE_POSICOES_GPS)
+Para mudar o tempo entre o envio de localizações geográficas, altere o valor de TEMPO_ENTRE_POSICOES_GPS no código-fonte. Por default, este valor é de 3600 segundos (uma hora).
+Lembre-se que quanto menor o tempo de envio de dados via LoRaWAN®, mais posições a fila de localização terá. Ela é calculada automaticamente para sempre suportar 8 horas de aquisição de localizações. Portanto, tempos entre envios de dados muito 
+curtos podem resultar na geração de uma fila muito grande e, consequentemente, ocupar muita memória RAM do ESP32. Dessa forma, modifique o valor de TEMPO_ENTRE_POSICOES_GPS com sabedoria.
+Este projeto faz uso de LoRaWAN® no modo ABP. Neste modo, o dispositivo precisará ter gravado em si as seguintes chaves: network session key e application session key. Ainda, o dispositivo terá que possuir o seu endereço na rede LoRaWAN® (device address). 
+No código-fonte do projeto, estas informações precisam ser preenchidas nas seguintes constantes: NWKSKEY, APPSKEY e DEVADDR. Tais informações são obtidas junto ao seu distribuidor LoRaWAN®, 
+sendo estas informações únicas por dispositivo (logo, não compartilhe com ninguém essas chaves!). Sendo assim, não se esqueça de colocar suas chaves no código, caso contrário não será possível utilizar a conectividade LoRaWAN®.
+
+///
+bibliotecas utilizadas são:
+
+1) MCCI LoRaWAN LMIC Library: Biblioteca para comunicação LoRaWAN® (stack LMIC). Este projeto faz uso da versão 2.3.2 desta biblioteca. Obtenha a versão 2.3.2 desta biblioteca no seu repositório Github oficial (https://github.com/mcci-catena/arduino-lmic) e a instale na Arduino IDE via Sketch > Include Library > Add .zip Library…
+
+Importante: antes de compilar qualquer programa usando essa biblioteca, é preciso configurar o país e banda a ser utilizada, de forma a ser possível comunicar-se com os gateways da ATC. Para isso, deve-se deixar o arquivo lmic_project_config.h (contido dentro na pasta da biblioteca: project_config/lmic_project_config.h) com o conteúdo conforme mostrado abaixo:
+
+// project-specific definitions
+//#define CFG_eu868 1
+//#define CFG_us915 1
+#define CFG_au921 1
+//#define CFG_as923 1
+// #define LMIC_COUNTRY_CODE LMIC_COUNTRY_CODE_JP
+//#define CFG_in866 1
+#define CFG_sx1276_radio 1
+//#define LMIC_USE_INTERRUPTS
+
+2) TinyGPS++: Biblioteca para comunicação com módulo GPS da placa.
+
+Obtenha esta biblioteca no seu repositório Github oficial (https://github.com/mikalhart/TinyGPSPlus) e a instale na Arduino IDE via Sketch > Include Library > Add .zip Library…
+
+3) AXP20X: Biblioteca para comunicação chip de gerenciamento de energia do módulo, de modo a permitir liberar energia para ligar o módulo GPS da placa. Obtenha esta biblioteca no seu repositório Github oficial 
+(https://github.com/lewisxhe/AXP202X_Library) e a instale na Arduino IDE via Sketch > Include Library > Add .zip Library…
+
+//
+task_leitura_gps: tarefa responsável por obter, de forma periódica (a cada hora), do módulo GPS as localizações geográficas e data/hora. Estes dados são armazenados numa fila, com posições (espaços) 
+suficientes para suportar até 8 horas de rastreamento. O uso de uma fila para armazenar as posições garante que estas fiquem armazenadas de forma segura e que sejam enviadas via LoRaWAN® na exata ordem com que foram inseridas na fila. A ordem de leitura é algo muito importante se você desejar traçar a rota que o rastreador percorreu, funcionalidade bastante comum em sistemas que utilizam localização GPS.
+task_lorawan: tarefa responsável por gerenciar a conectividade LoRaWAN® e fazer o envio da localização e data/hora para a nuvem via esta conectividade.
